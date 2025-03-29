@@ -1,9 +1,9 @@
 import streamlit as st
 from langchain_community.document_loaders import PDFPlumberLoader
 from langchain_experimental.text_splitter import SemanticChunker
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain_community.llms.ollama import Ollama
+from langchain_ollama import OllamaLLM
 from langchain.prompts import ChatPromptTemplate
 from langchain.chains.retrieval import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
@@ -66,14 +66,14 @@ if uploaded_file is not None:
     documents = text_splitter.split_documents(docs)
 
     #임베딩 모델 초기화 
-    embedder = HuggingFaceEmbeddings()
-
+    embedder = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    
     #벡터 스토어 생성 및 임베딩 추가 
     vector = FAISS.from_documents(documents,embedder)
     retriever = vector.as_retriever(search_type="similarity", search_kwargs={"k":3})
 
     #LLM 정의 
-    llm = Ollama(model="deepseek-r1:14b")
+    llm = OllamaLLM(model="deepseek-r1:14b")
 
     # 시스템 프롬프트 정의
     system_prompt = (
