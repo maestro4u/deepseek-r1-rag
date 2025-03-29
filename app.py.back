@@ -1,0 +1,229 @@
+import streamlit as st
+import os
+import pandas as pd
+import numpy as np
+import tempfile
+import matplotlib.pyplot as plt
+from PIL import Image
+import pytesseract
+from pdf2image import convert_from_path
+import tabula
+import docx
+import openpyxl
+
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_community.document_loaders import (
+    TextLoader, 
+    DirectoryLoader, 
+    PyPDFLoader, 
+    Docx2txtLoader,
+    CSVLoader,
+    UnstructuredExcelLoader
+)
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.llms import Ollama
+from langchain.chains import RetrievalQA
+from langchain.schema import Document
+
+# 페이지 제목 설정
+st.title("DeepSeek-R1 RAG 시스템")
+
+# Tesseract 경로 설정 (Windows 사용자는 경로 수정 필요)
+if os.name == 'nt':  # Windows
+    pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+# OCR 처리 함수
+def process_image_with_ocr(image):
+    text = pytesseract.image_to_string(image, lang='kor+eng')
+    return text
+
+# PDF에서 표 추출 함수
+def extract_tables_from_pdf(pdf_path):
+    tables = tabula.read_pdf(pdf_path, pages='all', multiple_tables=True)
+    return tables
+
+# 파일 처리 함수
+def process_file(file_path):
+    documents = []
+    file_ext = os.path.splitext(file_path)[1].lower()
+    
+    try:
+        if file_ext == '.txt':
+            loader = TextLoader(file_path)
+            documents = loader.load()
+        
+        elif file_ext == '.pdf':
+            # 일반 텍스트 추출
+            loader = PyPDFLoader(file_path)
+            documents = loader.load()
+            
+            # OCR 처리
+            try:
+                images = convert_from_path(file_path)
+                for i, image in enumerate(images):
+                    text = process_image_with_ocr(image)
+                    if text.strip():  # 빈 텍스트가 아닌 경우에만
+                        documents.append(Document(
+                            page_content=text,
+                            metadata={"source": file_path, "page": i+1, "type": "ocr"}
+                        ))
+            except Exception as e:
+                st.warning(f"OCR 처리 중 오류 발생: {str(e)}")
+            
+            # 표 추출
+            try:
+                tables = extract_tables_from_pdf(file_path)
+                for i, table in enumerate(tables):
+                    if not table.empty:
+                        table_text = table.to_string()
+                        documents.append(Document(
+                            page_content=f"표 {i+1}:\n{table_text}",
+                            metadata={"source": file_path, "table": i+1, "type": "table"}
+                        ))
+            except Exception as e:
+                st.warning(f"표 추출 중 오류 발생: {str(e)}")
+        
+        elif file_ext in ['.docx', '.doc']:
+            try:
+                loader = Docx2txtLoader(file_path)
+                documents = loader.load()
+            except:
+                loader = DocxLoader(file_path)
+                documents = loader.load()
+        
+        elif file_ext in ['.xlsx', '.xls']:
+            loader = UnstructuredExcelLoader(file_path, mode="elements")
+            documents = loader.load()
+        
+        elif file_ext == '.csv':
+            loader = CSVLoader(file_path)
+            documents = loader.load()
+    
+    except Exception as e:
+        st.error(f"파일 처리 중 오류 발생: {file_path}, 오류: {str(e)}")
+    
+    return documents
+
+# 사이드바에 문서 업로드 기능 추가
+with st.sidebar:
+    st.header("문서 업로드")
+    uploaded_files = st.file_uploader(
+        "파일을 업로드하세요", 
+        type=["txt", "pdf", "docx", "doc", "xlsx", "xls", "csv"], 
+        accept_multiple_files=True
+    )
+    
+    if uploaded_files:
+        # 업로드 폴더 생성
+        if not os.path.exists("uploaded_files"):
+            os.makedirs("uploaded_files")
+        
+        # 업로드된 파일 저장
+        for uploaded_file in uploaded_files:
+            with open(os.path.join("uploaded_files", uploaded_file.name), "wb") as f:
+                f.write(uploaded_file.getbuffer())
+        
+        st.success(f"{len(uploaded_files)}개 파일이 업로드되었습니다!")
+        
+        # 인덱싱 버튼
+        if st.button("문서 인덱싱"):
+            with st.spinner("문서를 처리 중입니다..."):
+                all_documents = []
+                
+                # 모든 파일 처리
+                for filename in os.listdir("uploaded_files"):
+                    file_path = os.path.join("uploaded_files", filename)
+                    if os.path.isfile(file_path):
+                        st.info(f"처리 중: {filename}")
+                        file_documents = process_file(file_path)
+                        all_documents.extend(file_documents)
+                        st.success(f"처리 완료: {filename}, {len(file_documents)}개 청크 추출")
+                
+                if all_documents:
+                    # 문서 분할
+                    text_splitter = RecursiveCharacterTextSplitter(
+                        chunk_size=1000,
+                        chunk_overlap=200
+                    )
+                    texts = text_splitter.split_documents(all_documents)
+                    
+                    # 임베딩 모델 설정
+                    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+                    
+                    # 벡터 저장소 생성
+                    db = FAISS.from_documents(texts, embeddings)
+                    db.save_local("faiss_index")
+                    
+                    st.success(f"문서 인덱싱이 완료되었습니다! 총 {len(texts)}개의 청크가 처리되었습니다.")
+                else:
+                    st.warning("처리할 문서가 없습니다.")
+
+    # 처리된 데이터 통계 표시
+    if os.path.exists("faiss_index"):
+        st.header("데이터 통계")
+        try:
+            embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+            db = FAISS.load_local("faiss_index", embeddings)
+            st.metric("인덱싱된 청크 수", len(db.index_to_docstore_id))
+        except Exception as e:
+            st.error(f"통계 정보 로드 오류: {str(e)}")
+
+# 메인 화면에 질문 입력 영역 추가
+st.header("질문하기")
+query = st.text_input("질문을 입력하세요")
+
+# 매개변수 설정
+with st.expander("고급 설정"):
+    k_value = st.slider("검색할 문서 수", min_value=1, max_value=10, value=3)
+    temperature = st.slider("응답 창의성 (Temperature)", min_value=0.0, max_value=1.0, value=0.3, step=0.1)
+    show_sources = st.checkbox("출처 표시", value=True)
+
+if query:
+    # 벡터 저장소가 존재하는지 확인
+    if os.path.exists("faiss_index"):
+        with st.spinner("답변을 생성 중입니다..."):
+            # 임베딩 모델 설정
+            embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+            
+            # 벡터 저장소 로드
+            db = FAISS.load_local("faiss_index", embeddings)
+            
+            # 출처 표시 기능이 활성화된 경우 관련 문서 검색
+            if show_sources:
+                retriever = db.as_retriever(search_kwargs={"k": k_value})
+                docs = retriever.get_relevant_documents(query)
+                
+                st.subheader("참조된 문서:")
+                for i, doc in enumerate(docs):
+                    source = doc.metadata.get("source", "알 수 없는 출처")
+                    doc_type = doc.metadata.get("type", "일반 텍스트")
+                    page = doc.metadata.get("page", "")
+                    
+                    source_info = f"출처: {os.path.basename(source)}"
+                    if page:
+                        source_info += f", 페이지: {page}"
+                    if doc_type:
+                        source_info += f", 유형: {doc_type}"
+                    
+                    with st.expander(f"문서 {i+1}: {source_info}"):
+                        st.text(doc.page_content[:500] + "..." if len(doc.page_content) > 500 else doc.page_content)
+            
+            # DeepSeek-R1 모델 설정
+            llm = Ollama(model="deepseek-r1", temperature=temperature)
+            
+            # RAG 체인 설정
+            qa_chain = RetrievalQA.from_chain_type(
+                llm=llm,
+                chain_type="stuff",
+                retriever=db.as_retriever(search_kwargs={"k": k_value})
+            )
+            
+            # 질문에 대한 답변 생성
+            response = qa_chain.invoke(query)
+            
+            # 답변 표시
+            st.subheader("답변:")
+            st.write(response["result"])
+    else:
+        st.warning("문서를 먼저 인덱싱해주세요!")
